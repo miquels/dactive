@@ -726,6 +726,20 @@ fn pct_decode(d: &[u8]) -> Vec<u8> {
     v
 }
 
+/// Percent-encode a string.
+pub fn percent_encode(s: &str) -> String {
+    let mut p = String::new();
+    for b in s.as_bytes().iter().map(|&b| b) {
+        if (b >= b'0' && b <= b'9') || (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') {
+            p.push(b as char);
+        } else {
+            p.push_str(&format!("%{:02x}", b));
+        }
+    }
+    p
+}
+
+
 // helper.
 fn u32_from_hex(data: &[u8]) -> Option<u32> {
     let hex = std::str::from_utf8(data).ok()?;

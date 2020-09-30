@@ -38,6 +38,40 @@ pub fn sync_active(db: &mut KpDb, active: &[u8]) -> io::Result<()> {
             db.insert(fields[0], &hm);
         }
     }
-    db.flush()
+
+    Ok(())
+}
+
+pub fn sync_newsgroups(db: &mut KpDb, newsgroups: &[u8]) -> io::Result<()> {
+
+    for line in newsgroups.split(|&b| b == b'\n') {
+
+        // If it's not UTF-8 just ignore it - what can we do?
+        let line = match std::str::from_utf8(line) {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+
+        // Check that it has at least two fields.
+        let mut iter = line.splitn(2, |c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
+        let name = iter.next().unwrap();
+        let desc = match iter.filter(|s| s.len() > 0).next() {
+            Some(desc) => desc,
+            None => continue,
+        };
+
+        // Look the group up in the current dactive.kp
+        // If we don't have it, ignore it.
+        let mut rec = match db.get_mut(name) {
+            Some(rec) => rec,
+            None => continue,
+        };
+
+        // Exists. Update it, if it hasn't changed it's a no-op.
+        let enc_desc = crate::kpdb::percent_encode(desc);
+        rec.set_str("GD", &enc_desc);
+    }
+
+    Ok(())
 }
 
