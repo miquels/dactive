@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 use std::sync::Mutex;
 
-use crate::kpdb::{Entry, KpDb};
+use crate::kpdb::{Record, KpDb};
 
 // contains the exclusively locked active file.
 pub struct ActiveFile(Mutex<ActiveInner>);
@@ -63,7 +63,7 @@ struct ActiveInner {
 }
 
 impl ActiveInner {
-    fn list_data(&self, entry: &Entry, buf: &mut Vec<u8>, active: bool) {
+    fn list_data(&self, entry: &Record, buf: &mut Vec<u8>, active: bool) {
         if active {
             self.list_active(entry, buf)
         } else {
@@ -71,7 +71,7 @@ impl ActiveInner {
         }
     }
 
-    fn list_active(&self, entry: &Entry, buf: &mut Vec<u8>) {
+    fn list_active(&self, entry: &Record, buf: &mut Vec<u8>) {
         // It's twice as fast to iterate once over all fields,
         // than to call entry.get_str() three times.
         let mut fields = entry.get_raw().split(|b| b.is_ascii_whitespace());
@@ -111,7 +111,7 @@ impl ActiveInner {
         buf.extend_from_slice(&b"\r\n"[..]);
     }
 
-    fn list_newsgroups(&self, entry: &Entry, buf: &mut Vec<u8>) {
+    fn list_newsgroups(&self, entry: &Record, buf: &mut Vec<u8>) {
         let name = match entry.get_name() {
             Some(name) => name,
             None => return,
@@ -176,7 +176,7 @@ pub struct GroupCounters {
 }
 
 impl GroupCounters {
-    fn read(entry: &Entry) -> GroupCounters {
+    fn read(entry: &Record) -> GroupCounters {
         let low = entry.get_u64("NB").unwrap_or(1);
         let high = entry.get_u64("NE").unwrap_or(0);
         let xref = entry.get_u64("NX").unwrap_or(1);

@@ -1,5 +1,45 @@
 //! Read / write a database in diablo's `dkp` format.
 //!
+//! Format of a kpdb database:
+//!
+//! Starts with a 'head' line:
+//!
+//! ```text
+//! $Vvv.vv aaaaaaaa mmmmmmmm cccccccc\n
+//! ```
+//!
+//! - Vvv.vv:   00.00  (version 0)
+//! - aaaaaaaa: append seq, hex, bumped whenver an append is made
+//! - mmmmmmmm: last modify timestamp to detect manual editing
+//! - cccccccc: appends since last sort
+//!
+//! Then each record has this format:
+//!
+//! ```text
+//! +ssssssss.mmmm:record_key key=value [key=value..]\n
+//! ```
+//!
+//! - ssssssss: sort offset field
+//! - mmmm:     modification counter
+//!
+//! The file can also contain deleted records (garbage), those are lines
+//! that start with a '-'. These are ignored.
+//!
+//! Diablo uses the "sort offset field" to order the database by record_key.
+//! It does a "re-sort" when "aaaaaaaa" >= 64, rewriting the "ssssssss" and
+//! "mmmm" fields of all records, and resetting "aaaaaaaa".
+//!
+//! We simply read the entire file on startup and keep an in-memory
+//! BTreeMap that maps each record_key to an offset and length,
+//! so we do not need that information.
+//!
+//! It's not too hard to keep interoperability with diablo:
+//!
+//! - always set "aaaaaaaa" to 10000000, this causes diablo to "re-sort"
+//!   the database when it starts up, fixing the "sssssssss" fields it needs.
+//! - always set "ssssssss" to 00000023 (offset of the first line)
+//! - always set "mmmmm" to 0000 (diablo appears to not use it either).
+//!
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
@@ -24,7 +64,7 @@ pub struct KpDb {
     // appends since last sort.
     append_sseq: u32,
     // for each group, location and current value of artno_xref.
-    entries: BTreeMap<String, EntryLoc>,
+    records: BTreeMap<String, RecordLoc>,
     // The mmap'd file (impl's DerefMut &[u8]).
     data: MmapMut,
     // Size of the mmap'ed file.
@@ -51,7 +91,7 @@ impl KpDb {
             let mut file = options
                 .open(&path)
                 .map_err(|e| io::Error::new(e.kind(), format!("kpdb: create {}: {}", path, e)))?;
-            write!(file, "$V00.00 00000000 {:08x} 00000000\n", unixtime_now())
+            write!(file, "$V00.00 00000000 {:08x} 10000000\n", unixtime_now())
                 .map_err(|e| io::Error::new(e.kind(), format!("kpdb: {}: {}", path, e)))?;
             file
         } else {
@@ -100,12 +140,12 @@ impl KpDb {
             io::Error::new(ErrorKind::InvalidData, format!("kpdb: {}: head: field 4 damaged", path))
         })?;
 
-        // Now walk over the individual entries.
+        // Now walk over the individual records.
         let mut pos = 35;
         let mut lineno = 1;
         let datasz = data.len();
 
-        let mut entries = BTreeMap::new();
+        let mut records = BTreeMap::new();
 
         loop {
             // Find the newline at the end of the line.
@@ -130,10 +170,10 @@ impl KpDb {
                 ));
             }
 
-            // Now parse it, and turn it into a EntryLoc struct.
+            // Now parse it, and turn it into a RecordLoc struct.
             // That struct has the offset and length of the line.
-            let (name, entry) = EntryLoc::new(line, pos as u32, lineno)?;
-            entries.insert(name, entry);
+            let (name, record) = RecordLoc::new(line, pos as u32, lineno)?;
+            records.insert(name, record);
 
             pos = idx + 1;
         }
@@ -142,7 +182,7 @@ impl KpDb {
             append_seq,
             modified,
             append_sseq,
-            entries,
+            records,
             data,
             datasz,
             file,
@@ -151,17 +191,19 @@ impl KpDb {
         })
     }
 
-    /// Check if we need to remap the database. This should be called
-    /// after every modification.
+    /// Write in-memory updates to disk.
+    ///
+    /// We only have in-memory updates if we could not update-in-place,
+    /// so usually (when simply updating counters) this does nothing.
     #[inline]
-    pub fn check_remap(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         if self.ndata.len() == 0 {
             return Ok(());
         }
-        self.do_check_remap()
+        self.do_flush()
     }
 
-    pub fn do_check_remap(&mut self) -> io::Result<()> {
+    pub fn do_flush(&mut self) -> io::Result<()> {
         // Will never happen but check anyway.
         if self.datasz + self.ndata.len() > MAX_FILE_SIZE {
             panic!(format!(
@@ -170,10 +212,24 @@ impl KpDb {
             ));
         }
 
+        let mut ndata = std::mem::replace(&mut self.ndata, Vec::new());
+        if ndata.len() > 1000 {
+            // This change is more than a few records, so chances are that
+            // there are multiple updates pending for the same record.
+            // Only include lines that start with '+'.
+            let mut d = Vec::new();
+            for line in ndata.split(|&b| b == b'\n') {
+                if line.len() > 0 && line[0] == b'+' {
+                    d.extend_from_slice(line);
+                    d.push(b'\n');
+                }
+            }
+            ndata = d;
+        }
+
         // First append 'ndata' to the database file. If that fails, try to
         // recover and get to a stable state, and return an IO error.
         let oldlen = self.file.seek(io::SeekFrom::End(0))?;
-        let ndata = std::mem::replace(&mut self.ndata, Vec::new());
         if let Err(e) = self.file.write_all(&ndata) {
             match self.file.metadata() {
                 Err(_) => {
@@ -203,6 +259,13 @@ impl KpDb {
             }
         }
 
+        // Set append_sseq to 10000000, this is not used by us, but if you ever use
+        // this database with diablo again it will make diablo re-sort the db keys.
+        if self.append_sseq < 0x10000000 {
+            self.append_sseq = 0x10000000;
+            self.data[26..34].copy_from_slice("10000000".as_bytes());
+        }
+
         // Now do a new mmap. Too bad we cannot use mremap, this is expensive.
         // If this fails, we are in an unrecoverable state.
         let data = match unsafe { MmapMut::map_mut(&self.file) } {
@@ -216,61 +279,66 @@ impl KpDb {
         Ok(())
     }
 
-    /// Get an `Entry` from the database. The `Entry` holds a multiple
+    /// Get an `Record` from the database. The `Record` holds a multiple
     /// key/value pairs.
-    pub fn get(&self, key: &str) -> Option<Entry<'_>> {
-        self.entries.get(key).map(move |e| Entry::from_loc(e, self))
+    pub fn get(&self, key: &str) -> Option<Record<'_>> {
+        self.records.get(key).map(move |e| Record::from_loc(e, self))
     }
 
-    /// Get an `EntryMut` from the database. Like `Entry`, but mutable.
-    pub fn get_mut(&mut self, key: &str) -> Option<EntryMut<'_>> {
-        if let Some(loc) = self.entries.get(key) {
-            Some(EntryMut::from_loc(loc.clone(), self))
+    /// Get an `RecordMut` from the database. Like `Record`, but mutable.
+    pub fn get_mut(&mut self, key: &str) -> Option<RecordMut<'_>> {
+        if let Some(loc) = self.records.get(key) {
+            Some(RecordMut::from_loc(loc.clone(), self))
         } else {
             None
         }
     }
 
-    /// Insert a new Entry in the database.
+    /// Insert a new Record in the database.
     pub fn insert<'a>(&'a mut self, key: &str, kvpairs: &HashMap<&'static str, String>) {
-        let start = self.datasz + self.ndata.len();
-        let mut s = format!("+{:08x}.0000:{}", start, key);
+
+        let mut s = format!("+00000023.0000:{}", key);
         for (k, v) in kvpairs {
             s.push_str(&format!(" {}={}", k, v));
         }
-        s.push('\n');
+
+        let now = unixtime_now();
+        s.push_str(&format!(" CTS={:08x} LMTS={:08x}\n", now, now));
+
+        let start = self.datasz + self.ndata.len();
         self.ndata.extend_from_slice(s.as_bytes());
         let end = self.datasz + self.ndata.len();
-        let entry_loc = EntryLoc {
+
+        let record_loc = RecordLoc {
             lineno: 0,
             offset: start as u32,
             len: (end - start) as u16,
         };
-        self.entries.insert(key.to_string(), entry_loc.clone());
+        self.records.insert(key.to_string(), record_loc);
     }
 
-    /// Iterate over all `Entry`s in the database.
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a str, Entry<'a>)> {
-        self.entries
+    /// Iterate over all `Record`s in the database.
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a str, Record<'a>)> {
+        self.records
             .iter()
-            .map(move |(k, v)| (k.as_str(), Entry::from_loc(v, self)))
+            .map(move |(k, v)| (k.as_str(), Record::from_loc(v, self)))
     }
 }
 
-// An EntryLoc is a reference to an Entry in the database,
+// An RecordLoc is a reference to an Record in the database,
 // it's what we store in the in-memory btree to refer to
 // the actual data by offset + len. `line` is for context
 // information in errors etc.
 #[derive(Clone)]
-struct EntryLoc {
+struct RecordLoc {
     lineno: u32,
     offset: u32,
     len: u16,
 }
 
-impl EntryLoc {
-    // Parse a line, check its validity, then return an `EntryLoc` for it.
-    fn new(line: &[u8], offset: u32, lineno: u32) -> io::Result<(String, EntryLoc)> {
+impl RecordLoc {
+    // Parse a line, check its validity, then return an `RecordLoc` for it.
+    fn new(line: &[u8], offset: u32, lineno: u32) -> io::Result<(String, RecordLoc)> {
         // Some sanity checks.
         if line.len() < 18 || line[14] != b':' {
             return Err(io::Error::new(
@@ -287,9 +355,9 @@ impl EntryLoc {
             )
         })?;
 
-        let entry = Entry { line, lineno };
+        let record = Record { line, lineno };
 
-        let name = entry
+        let name = record
             .get_name()
             .ok_or_else(|| {
                 io::Error::new(
@@ -305,7 +373,7 @@ impl EntryLoc {
         // but as long as we _only_ use this for dactive.kp it's
         // a good consistency check.
         for key in vec!["NB", "NE", "NX", "S", "CTS", "LMTS"].into_iter() {
-            entry.get_str(key).ok_or_else(|| {
+            record.get_str(key).ok_or_else(|| {
                 io::Error::new(
                     ErrorKind::InvalidData,
                     format!("dactive.kp: line {}: {} missing", lineno, key),
@@ -315,7 +383,7 @@ impl EntryLoc {
 
         Ok((
             name,
-            EntryLoc {
+            RecordLoc {
                 lineno,
                 offset,
                 len: line.len() as u16,
@@ -324,23 +392,23 @@ impl EntryLoc {
     }
 }
 
-/// A handle for an entry in the database.
+/// A handle for an record in the database.
 #[derive(Clone)]
-pub struct Entry<'a> {
+pub struct Record<'a> {
     lineno: u32,
     line: &'a [u8],
 }
 
-impl<'a> Entry<'a> {
-    // internal build an entry from an EntryLoc.
-    fn from_loc<'b>(e: &EntryLoc, kpdb: &'b KpDb) -> Entry<'b> {
+impl<'a> Record<'a> {
+    // internal build an record from an RecordLoc.
+    fn from_loc<'b>(e: &RecordLoc, kpdb: &'b KpDb) -> Record<'b> {
         let mut data: &[u8] = &kpdb.data;
         let mut start = e.offset as usize;
         if start >= kpdb.datasz {
             // If it starts beyond the data in the file, it's a buffered
-            // entry that does not exist in the database file yet.
+            // record that does not exist in the database file yet.
             //
-            // That's an optimization, for when we add a lot of new entries
+            // That's an optimization, for when we add a lot of new records
             // in succession, so that we do not have to mremap() all the time.
             //
             // Adjust the offset and refer to that internal buffered data.
@@ -348,13 +416,13 @@ impl<'a> Entry<'a> {
             data = &kpdb.ndata;
         }
         let end = start + e.len as usize;
-        Entry {
+        Record {
             lineno: e.lineno,
             line: &data[start..end],
         }
     }
 
-    /// Get a direct reference to the raw data of this entry (name key1=val1 ...)
+    /// Get a direct reference to the raw data of this record (name key1=val1 ...)
     pub fn get_raw(&'a self) -> &'a [u8] {
         if self.line.len() < 15 {
             &b""[..]
@@ -363,7 +431,7 @@ impl<'a> Entry<'a> {
         }
     }
 
-    /// Get the name of this entry. Can only fail if the database is corrupt.
+    /// Get the name of this record. Can only fail if the database is corrupt.
     /// (Perhaps we should use a Result instead of an Option).
     pub fn get_name(&'a self) -> Option<&'a str> {
         get_name(self.line)
@@ -388,51 +456,56 @@ impl<'a> Entry<'a> {
     }
 }
 
-/// A handle for a mutable entry in the database.
-pub struct EntryMut<'a> {
+/// A handle for a mutable record in the database.
+pub struct RecordMut<'a> {
     kpdb: &'a mut KpDb,
-    entry_loc: EntryLoc,
+    record_loc: RecordLoc,
+    changed: bool,
     modified: Option<HashMap<&'static [u8], String>>,
 }
 
-impl<'a> EntryMut<'a> {
-    // See Entry::from_loc().
-    fn from_loc<'b>(entry_loc: EntryLoc, kpdb: &'b mut KpDb) -> EntryMut<'b> {
-        EntryMut {
+impl<'a> RecordMut<'a> {
+    // See Record::from_loc().
+    fn from_loc<'b>(record_loc: RecordLoc, kpdb: &'b mut KpDb) -> RecordMut<'b> {
+        RecordMut {
             kpdb,
-            entry_loc,
+            record_loc,
+            changed: false,
             modified: None,
         }
     }
 
     // Since we keep an &mut KpDb in self, we cannot also keep a &line[u8]
-    // there - no self-referencing structs in rust. So we get it via entry_loc.
+    // there - no self-referencing structs in rust. So we get it via record_loc.
     fn line(&self) -> &[u8] {
         let mut data = &self.kpdb.data[..];
-        let mut start = self.entry_loc.offset as usize;
+        let mut start = self.record_loc.offset as usize;
         if start >= self.kpdb.datasz {
             start -= self.kpdb.datasz;
             data = &self.kpdb.ndata[..];
         }
-        let end = start + self.entry_loc.len as usize;
+        let end = start + self.record_loc.len as usize;
         &data[start..end]
     }
 
     // Since we keep an &mut KpDb in self, we cannot also keep a &mut line[u8]
-    // there - no self-referencing structs in rust. So we get it via entry_loc.
+    // there - no self-referencing structs in rust. So we get it via record_loc.
     fn line_mut(&mut self) -> &mut [u8] {
         let mut data = &mut self.kpdb.data[..];
-        let mut start = self.entry_loc.offset as usize;
+        let mut start = self.record_loc.offset as usize;
         if start >= self.kpdb.datasz {
             start -= self.kpdb.datasz;
             data = &mut self.kpdb.ndata[..];
         }
-        let end = start + self.entry_loc.len as usize;
+        let end = start + self.record_loc.len as usize;
         &mut data[start..end]
     }
 
     /// Set or replace a string value.
     pub fn set_str(&mut self, key: &'static str, val: &str) {
+
+        self.changed = true;
+
         // If we can modify the value in-place, do so.
         let line = self.line_mut();
         if let Some(range) = get_range(key, line) {
@@ -441,6 +514,7 @@ impl<'a> EntryMut<'a> {
                 return;
             }
         }
+
         // Otherwise stash the new value, we will deal with it later (on Drop).
         self.modified
             .get_or_insert_with(|| HashMap::new())
@@ -465,18 +539,21 @@ impl<'a> EntryMut<'a> {
 }
 
 /// On drop, see if the self.modified hashmap is non-empty. If it is
-/// not, we could not modify-in-place, so write a new entry for this line.
-impl<'a> Drop for EntryMut<'a> {
+/// not, we could not modify-in-place, so write a new record for this line.
+impl<'a> Drop for RecordMut<'a> {
     fn drop(&mut self) {
+        if self.changed {
+            self.set_str("LMTS", &format!("{:08x}", unixtime_now()));
+        }
         if let Some(mut hm) = self.modified.take() {
-            // invalidate old entry.
+            // invalidate old record.
             self.line_mut()[0] = b'-';
 
-            // Now remember location in ndata so we can update self.entries.
+            // Now remember location in ndata so we can update self.records.
             let start = self.kpdb.ndata.len() + self.kpdb.datasz;
             let mut name = Vec::new();
 
-            // Make a copy of the line, validate, start building new entry.
+            // Make a copy of the line, validate, start building new record.
             let mut line = self.line().to_vec();
             line[0] = b'+';
             self.kpdb.ndata.extend_from_slice(&line[..15]);
@@ -489,7 +566,7 @@ impl<'a> Drop for EntryMut<'a> {
                     continue;
                 }
 
-                // Split key/value on '='. Add key to new entry.
+                // Split key/value on '='. Add key to new record.
                 let mut kv = field.splitn(2, |&b| b == b'=');
                 let key = kv.next().unwrap();
                 if !first {
@@ -498,7 +575,7 @@ impl<'a> Drop for EntryMut<'a> {
                 self.kpdb.ndata.extend_from_slice(key);
 
                 if first {
-                    // This was the name of the entry, not a key/value pair.
+                    // This was the name of the record, not a key/value pair.
                     first = false;
                     name = key.to_vec();
                     println!("XXX Drop {:?}: updating: {:?}", std::str::from_utf8(key), hm);
@@ -531,9 +608,9 @@ impl<'a> Drop for EntryMut<'a> {
             let end = self.kpdb.ndata.len() + self.kpdb.datasz;
             println!("XXX ndata is now: {:?}", std::str::from_utf8(&self.kpdb.ndata));
             let name = String::from_utf8(name).unwrap();
-            self.kpdb.entries.insert(
+            self.kpdb.records.insert(
                 name,
-                EntryLoc {
+                RecordLoc {
                     lineno: 0,
                     offset: start as u32,
                     len: (end - start) as u16,
@@ -594,7 +671,7 @@ fn get_range(key: &str, line: &[u8]) -> Option<Range> {
 }
 
 // Helper.
-// Get the name of this entry.
+// Get the name of this record.
 fn get_name(line: &[u8]) -> Option<&str> {
     if line.len() < 15 {
         return None;
@@ -678,20 +755,17 @@ mod tests {
         let mut db = KpDb::open("test.kp", true).expect("test.kp");
 
         let mut kv = HashMap::new();
-        let now_hex = format!("{:08x}", unixtime_now());
         kv.insert("NB", "0000000001".into());
         kv.insert("NE", "0000000000".into());
         kv.insert("NX", "0000000000".into());
         kv.insert("S", "y".into());
-        kv.insert("CTS", now_hex.clone());
-        kv.insert("LMTS", now_hex);
 
         db.insert("test.1", &kv);
 
         kv.insert("GD", "testgroup2".into());
         db.insert("test.2", &kv);
 
-        db.check_remap().expect("remap");
+        db.flush().expect("remap");
 
         {
             let mut t1 = db.get_mut("test.1").expect("test.1");
@@ -703,7 +777,7 @@ mod tests {
             t1.set_str("GD", "testgroup1");
             drop(t1);
 
-            db.check_remap().expect("remap");
+            db.flush().expect("remap");
         }
 
         let t1 = db.get("test.1").expect("test.1");
